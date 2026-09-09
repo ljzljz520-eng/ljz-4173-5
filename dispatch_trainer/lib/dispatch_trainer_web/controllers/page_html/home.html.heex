@@ -1,0 +1,19 @@
+<div class="mx-auto max-w-3xl px-4 py-16">
+  <h1 class="text-3xl font-bold mb-4">急救调度培训中心 · 模拟报警演练平台</h1>
+  <p class="text-zinc-600 mb-8">
+    学员在信息不全与情绪干扰下完成地点确认、危险识别与到车前指导;
+    教员通过控制台释放信息、触发分支并逐项评分。
+  </p>
+  <div class="space-x-4">
+    <.link :if={!@current_user} href={~p"/login"} class="rounded bg-indigo-600 px-4 py-2 text-white">
+      登录
+    </.link>
+    <.link
+      :if={@current_user && DispatchTrainer.Accounts.User.instructor?(@current_user)}
+      href={~p"/instructor"}
+      class="rounded bg-indigo-600 px-4 py-2 text-white"
+    >
+      教员控制台
+    </.link>
+  </div>
+</div>

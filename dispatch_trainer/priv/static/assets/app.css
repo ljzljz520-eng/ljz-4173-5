@@ -1,0 +1,2 @@
+/* 基础样式: 依赖 Tailwind CDN 之外的极简兜底 */
+body { font-family: ui-sans-serif, system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; }

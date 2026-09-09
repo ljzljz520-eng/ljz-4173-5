@@ -1,0 +1,30 @@
+<header class="px-4 sm:px-6 lg:px-8">
+  <div class="flex items-center justify-between border-b border-zinc-100 py-3 text-sm">
+    <div class="flex items-center gap-4">
+      <.link href={~p"/"} class="font-bold text-lg">急救调度培训</.link>
+    </div>
+    <div class="flex items-center gap-4 leading-6 text-zinc-900">
+      <%= if @current_user do %>
+        <span class="text-zinc-600">
+          {@current_user.display_name || @current_user.username}（{role_label(@current_user.role)}）
+        </span>
+        <.link
+          :if={DispatchTrainer.Accounts.User.instructor?(@current_user)}
+          href={~p"/instructor"}
+          class="hover:text-zinc-600"
+        >
+          教员控制台
+        </.link>
+        <.link href={~p"/logout"} method="delete" class="hover:text-zinc-600">退出</.link>
+      <% else %>
+        <.link href={~p"/login"} class="hover:text-zinc-600">登录</.link>
+      <% end %>
+    </div>
+  </div>
+</header>
+<main class="px-4 py-8 sm:px-6 lg:px-8">
+  <div class="mx-auto max-w-6xl">
+    <.flash_group flash={@flash} />
+    {@inner_content}
+  </div>
+</main>

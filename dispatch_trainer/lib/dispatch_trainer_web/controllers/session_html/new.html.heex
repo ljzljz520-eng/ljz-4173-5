@@ -1,0 +1,11 @@
+<div class="mx-auto max-w-sm py-10">
+  <h1 class="text-2xl font-semibold mb-6">急救调度培训平台登录</h1>
+
+  <.simple_form :let={f} for={%{}} as={:user} action={~p"/login"}>
+    <.input field={f[:username]} type="text" label="用户名" required />
+    <.input field={f[:password]} type="password" label="口令" required />
+    <:actions>
+      <.button class="w-full">登录</.button>
+    </:actions>
+  </.simple_form>
+</div>
