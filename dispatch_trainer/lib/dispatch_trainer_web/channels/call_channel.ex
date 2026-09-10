@@ -47,25 +47,40 @@ defmodule DispatchTrainerWeb.CallChannel do
 
   # ---- 控制事件 ----
 
+  # 中断/恢复/释放/分支/结束均为“教员控制动作”, 学员加入通话后也无权执行
+
   def handle_in("interrupt", _payload, socket) do
-    reply_result(SessionServer.interrupt(socket.assigns.server, actor(socket)), socket)
+    guard_instructor(socket, fn ->
+      reply_result(SessionServer.interrupt(socket.assigns.server, actor(socket)), socket)
+    end)
   end
 
   def handle_in("resume", _payload, socket) do
-    reply_result(SessionServer.resume(socket.assigns.server, actor(socket)), socket)
+    guard_instructor(socket, fn ->
+      reply_result(SessionServer.resume(socket.assigns.server, actor(socket)), socket)
+    end)
   end
 
   def handle_in("release_info", %{"key" => key}, socket) do
-    reply_result(SessionServer.release_info(socket.assigns.server, key, actor(socket)), socket)
+    guard_instructor(socket, fn ->
+      reply_result(SessionServer.release_info(socket.assigns.server, key, actor(socket)), socket)
+    end)
   end
 
   def handle_in("trigger_branch", %{"key" => key}, socket) do
-    reply_result(SessionServer.trigger_branch(socket.assigns.server, key, actor(socket)), socket)
+    guard_instructor(socket, fn ->
+      reply_result(SessionServer.trigger_branch(socket.assigns.server, key, actor(socket)), socket)
+    end)
   end
 
   def handle_in("log", %{"kind" => kind, "payload" => payload}, socket)
       when kind in @loggable_kinds do
-    reply_result(SessionServer.log(socket.assigns.server, actor(socket), kind, payload), socket)
+    # 学员只能以 trainee 身份记录自己的提问/确认/指令, 无其他控制动作
+    with :ok <- permit_log(socket, kind) do
+      reply_result(SessionServer.log(socket.assigns.server, actor(socket), kind, payload), socket)
+    else
+      {:error, reason} -> {:reply, {:error, %{reason: reason}}, socket}
+    end
   end
 
   def handle_in("log", _payload, socket) do
@@ -73,10 +88,12 @@ defmodule DispatchTrainerWeb.CallChannel do
   end
 
   def handle_in("end", _payload, socket) do
-    case SessionServer.end_call(socket.assigns.server, actor(socket)) do
-      {:ok, recording} -> {:reply, {:ok, %{recording_id: recording.id}}, socket}
-      {:error, reason} -> {:reply, {:error, %{reason: to_string(reason)}}, socket}
-    end
+    guard_instructor(socket, fn ->
+      case SessionServer.end_call(socket.assigns.server, actor(socket)) do
+        {:ok, recording} -> {:reply, {:ok, %{recording_id: recording.id}}, socket}
+        {:error, reason} -> {:reply, {:error, %{reason: to_string(reason)}}, socket}
+      end
+    end)
   end
 
   # ---- 会话广播 ----
@@ -114,6 +131,18 @@ defmodule DispatchTrainerWeb.CallChannel do
     {:noreply, socket}
   end
 
+  # 来电者/背景声 PCM 帧, 以二进制推给浏览器播放(“听得见的来电”)
+  def handle_info({:voice_frame, kind, frame, _meta}, socket) do
+    push(socket, "audio", {:binary, frame})
+    {:noreply, assign(socket, :last_voice_kind, kind)}
+  end
+
+  # 与语音同帧发出的文字字幕
+  def handle_info({:caller_speech, kind, text}, socket) do
+    push(socket, "caller_speech", %{"kind" => to_string(kind), "text" => text})
+    {:noreply, socket}
+  end
+
   def handle_info(_message, socket), do: {:noreply, socket}
 
   defp authorized?(nil, _session), do: false
@@ -127,6 +156,24 @@ defmodule DispatchTrainerWeb.CallChannel do
 
   defp role_of(%Accounts.User{role: "trainee"}), do: "trainee"
   defp role_of(%Accounts.User{role: role}) when role in ["instructor", "admin"], do: "instructor"
+
+  # 仅主持教员/管理员可执行教员控制动作
+  defp instructor?(%Accounts.User{} = user), do: Accounts.User.instructor?(user)
+
+  defp guard_instructor(socket, fun) do
+    if instructor?(socket.assigns.user) do
+      fun.()
+    else
+      {:reply, {:error, %{reason: "forbidden_instructor_action"}}, socket}
+    end
+  end
+
+  # 学员仅能记录自己的提问/确认/指令; 教员身份不受限
+  defp permit_log(%{assigns: %{user: %Accounts.User{role: "trainee"}}}, _kind), do: :ok
+
+  defp permit_log(%{assigns: %{user: %Accounts.User{} = user}}, _kind) do
+    if Accounts.User.instructor?(user), do: :ok, else: {:error, "forbidden"}
+  end
 
   defp reply_result(:ok, socket), do: {:reply, :ok, socket}
   defp reply_result({:ok, _result}, socket), do: {:reply, :ok, socket}

@@ -14,7 +14,7 @@ defmodule DispatchTrainer.Sessions.SessionServer do
   use GenServer, restart: :temporary
 
   alias DispatchTrainer.{Sessions, Recordings, VirtualCaller}
-  alias DispatchTrainer.Audio.{JitterBuffer, Opus, Packet}
+  alias DispatchTrainer.Audio.{JitterBuffer, Opus, Packet, CallerVoice}
   alias DispatchTrainer.Sessions.Session
 
   defstruct session: nil,
@@ -27,7 +27,9 @@ defmodule DispatchTrainer.Sessions.SessionServer do
             timers: %{},
             jitter: nil,
             rec_packets: [],
-            rec_bytes: 0
+            rec_bytes: 0,
+            voice_seq: 0,
+            voice_out: []
 
   # ---------- 客户端 API ----------
 
@@ -87,6 +89,10 @@ defmodule DispatchTrainer.Sessions.SessionServer do
   @doc "接收一路音频包(经抖动缓冲)。通话非 active 状态时拒绝。"
   def audio_packet(pid, %Packet{} = packet), do: GenServer.call(pid, {:audio_packet, packet})
 
+  @doc "教员手动播放指定背景声(校验 key, 仅 active 通话)。"
+  def play_background(pid, key, actor \\ "instructor"),
+    do: GenServer.call(pid, {:play_background, key, actor})
+
   @doc "标记录音敏感时间段(用于脱敏导出)。"
   def mark_pii(pid, label, start_ms, end_ms, actor \\ "instructor"),
     do: GenServer.call(pid, {:mark_pii, label, start_ms, end_ms, actor})
@@ -129,13 +135,16 @@ defmodule DispatchTrainer.Sessions.SessionServer do
     state = release_initial(state)
 
     broadcast(state, {:call_state, :active})
+
+    # 来电接通后来电者开口(开场白), 让学员“听得见”来电
+    state = queue_voice(state, :speech, VirtualCaller.greeting(state.scenario), "caller")
     {:reply, :ok, state}
   end
 
   def handle_call(:join_call, _from, state), do: {:reply, :ok, state}
 
   def handle_call({:release_info, key, actor}, _from, state) do
-    case do_release(state, key, actor) do
+    case do_release(state, key, actor, state.call_state == :active) do
       {:ok, release, state} -> {:reply, {:ok, release}, state}
       {:error, reason, state} -> {:reply, {:error, reason}, state}
     end
@@ -173,6 +182,14 @@ defmodule DispatchTrainer.Sessions.SessionServer do
           end
 
         broadcast(state, {:branch_triggered, branch})
+        # 病情变化由来电者“说出来”, 学员端可听见
+        state =
+          if state.call_state == :active and branch.reveal_content not in [nil, ""] do
+            queue_voice(state, :speech, VirtualCaller.branch_utterance(state.scenario, branch), "caller")
+          else
+            state
+          end
+
         {:reply, {:ok, branch}, state}
     end
   end
@@ -188,7 +205,9 @@ defmodule DispatchTrainer.Sessions.SessionServer do
       state
       | session: session,
         call_state: :interrupted,
-        interrupted_mono: System.monotonic_time(:millisecond)
+        interrupted_mono: System.monotonic_time(:millisecond),
+        # 中断后丢弃尚未播完/正在合成的语音
+        voice_out: []
     }
 
     {:ok, _} = log_event(state, actor, "interrupt", %{"count" => session.interrupt_count})
@@ -224,19 +243,29 @@ defmodule DispatchTrainer.Sessions.SessionServer do
   def handle_call({:trainee_question, text}, _from, state) do
     {:ok, _event} = log_event(state, "trainee", "question", %{"text" => text})
 
-    # 命中关键词的“提问触发”信息随即释放
+    # 命中关键词的“提问触发”信息随即释放; 回答本身会发声, 这里不再重复
     state =
       state.scenario.info_releases
       |> Enum.filter(&(&1.trigger_type == "question"))
       |> Enum.filter(&VirtualCaller.question_matches?(&1, text))
       |> Enum.reduce(state, fn release, acc ->
-        case do_release(acc, release.key, "caller") do
+        case do_release(acc, release.key, "caller", false) do
           {:ok, _release, acc} -> acc
           {:error, _reason, acc} -> acc
         end
       end)
 
     reply = VirtualCaller.answer(state.scenario, state.released, text)
+    # 学员提问后, 来电者的回答以可听见的语音回放
+    {tag, utterance, _} = reply
+
+    state =
+      if state.call_state == :active do
+        queue_voice(state, :speech, utterance, "caller", %{reply_type: to_string(tag)})
+      else
+        state
+      end
+
     {:reply, reply, state}
   end
 
@@ -273,6 +302,29 @@ defmodule DispatchTrainer.Sessions.SessionServer do
     {:reply, {:ok, event}, state}
   end
 
+  def handle_call({:play_background, key, actor}, _from, state) do
+    case find_background(state, key) do
+      nil ->
+        {:reply, {:error, :unknown_audio}, state}
+
+      audio ->
+        if state.call_state == :active do
+          {:ok, _} =
+            log_event(state, actor, "background_audio", %{
+              "key" => audio.key,
+              "label" => audio.label,
+              "duration_ms" => audio.duration_ms
+            })
+
+          broadcast(state, {:background_audio, audio})
+          state = queue_voice(state, :ambience, audio, "system")
+          {:reply, {:ok, audio}, state}
+        else
+          {:reply, {:error, :not_active}, state}
+        end
+    end
+  end
+
   def handle_call({:end_call, actor}, _from, %{call_state: cs} = state)
       when cs in [:active, :interrupted] do
     {:ok, session} =
@@ -280,6 +332,8 @@ defmodule DispatchTrainer.Sessions.SessionServer do
 
     state = %{state | session: session, call_state: :ended}
     state = cancel_timers(state)
+    # 通话结束: 停止尚未播完的来电者语音
+    state = %{state | voice_out: []}
 
     {:ok, _} = log_event(state, actor, "system", %{"event" => "call_ended"})
 
@@ -309,7 +363,7 @@ defmodule DispatchTrainer.Sessions.SessionServer do
   @impl true
   def handle_info({:timed_release, key}, state) do
     state =
-      case do_release(state, key, "caller") do
+      case do_release(state, key, "caller", state.call_state == :active) do
         {:ok, _release, state} -> state
         {:error, _reason, state} -> state
       end
@@ -327,9 +381,26 @@ defmodule DispatchTrainer.Sessions.SessionServer do
         })
 
       broadcast(state, {:background_audio, audio})
+      state = queue_voice(state, :ambience, audio, "system")
+      {:noreply, state}
+    else
+      {:noreply, state}
     end
+  end
 
-    {:noreply, state}
+  # 合成在独立进程完成后回送; 按队列出帧, 避免多路语音交叠
+  def handle_info({:voice_ready, seq, kind, frames, meta}, state) do
+    out =
+      Enum.map(state.voice_out, fn
+        {s, :pending, _k, _f, _m} when s == seq -> {s, :ready, kind, frames, meta}
+        entry -> entry
+      end)
+
+    {:noreply, pump_voice(%{state | voice_out: out})}
+  end
+
+  def handle_info(:voice_tick, state) do
+    {:noreply, pump_voice(state)}
   end
 
   def handle_info(_message, state), do: {:noreply, state}
@@ -356,20 +427,99 @@ defmodule DispatchTrainer.Sessions.SessionServer do
     Enum.find(state.scenario.branches, &(&1.key == key))
   end
 
-  # 释放场景脚本中定义的信息
-  defp do_release(state, key, actor) do
-    case find_release(state, key) do
-      nil -> {:error, :unknown_info, state}
-      release -> do_release_info(state, release, actor)
+  defp find_background(state, key) do
+    Enum.find(state.scenario.background_audios, &(&1.key == key))
+  end
+
+  # 把一段语音/背景声加入播放队列; 渲染在独立进程完成后回送本进程,
+  # 再由 pump_voice 以固定帧间隔顺序推出, 保证语音不交错。
+  defp queue_voice(state, kind, payload, _actor, meta \\ %{}) do
+    seq = state.voice_seq + 1
+    server = self()
+    scenario = state.scenario
+
+    meta =
+      if kind == :speech and is_binary(payload),
+        do: Map.put(meta, :text, payload),
+        else: Map.put(meta, :text, Map.get(meta, :label))
+
+    Task.start(fn ->
+      frames = render_voice(kind, payload, scenario)
+      send(server, {:voice_ready, seq, kind, frames, meta})
+    end)
+
+    %{state | voice_seq: seq, voice_out: state.voice_out ++ [{seq, :pending, kind, nil, meta}]}
+  end
+
+  defp render_voice(:speech, text, scenario) when is_binary(text) do
+    emotion =
+      case scenario && scenario.caller_profile do
+        %{emotion_level: level} when is_binary(level) -> level
+        _ -> "anxious"
+      end
+
+    CallerVoice.speech_frames(text, emotion)
+  end
+
+  defp render_voice(:ambience, audio, _scenario) do
+    duration = max(audio.duration_ms || 0, 1000)
+    CallerVoice.ambience_frames(audio.key, duration, audio.volume || 0.6)
+  end
+
+  # 队头为已就绪语音时, 每 20ms 推出一帧; 队头尚在合成则等待。
+  defp pump_voice(%{call_state: :active} = state) do
+    case state.voice_out do
+      [{seq, :ready, kind, frames, meta} | tail] ->
+        [frame | rest] = frames
+        broadcast(state, {:voice_frame, kind, frame, meta})
+
+        # 首帧同时推送一条文字字幕事件(与可听见语音对应)
+        if meta[:text] not in [nil, ""] do
+          broadcast(state, {:caller_speech, kind, meta.text})
+        end
+
+        Process.send_after(self(), :voice_tick, 20)
+
+        state =
+          case rest do
+            [] ->
+              next = %{state | voice_out: tail}
+              # 当前语音播完, 若下一段已合成则立刻继续, 不留间隔
+              pump_voice(next)
+
+            _ ->
+              %{state | voice_out: [{seq, :ready, kind, rest, %{meta | text: nil}} | tail]}
+          end
+
+        state
+
+      [{_seq, :pending, _kind, _frames, _meta} | _] ->
+        state
+
+      [] ->
+        state
+
+      _ ->
+        state
     end
   end
 
-  # 释放分支带来的临时信息(不在场景 info_releases 中)
-  defp do_release_virtual(state, key, label, content, actor) do
-    do_release_info(state, %{key: key, label: label, content: content}, actor)
+  defp pump_voice(state), do: state
+
+  # 释放场景脚本中定义的信息。speak=true 时由来电者主动说出该内容(可听见)。
+  defp do_release(state, key, actor, speak) do
+    case find_release(state, key) do
+      nil -> {:error, :unknown_info, state}
+      release -> do_release_info(state, release, actor, speak)
+    end
   end
 
-  defp do_release_info(state, release, actor) do
+  # 释放分支带来的临时信息(不在场景 info_releases 中), 语音由分支流程统一处理
+  defp do_release_virtual(state, key, label, content, actor) do
+    do_release_info(state, %{key: key, label: label, content: content}, actor, false)
+  end
+
+  defp do_release_info(state, release, actor, speak) do
     if MapSet.member?(state.released, release.key) do
       {:error, :already_released, state}
     else
@@ -383,6 +533,14 @@ defmodule DispatchTrainer.Sessions.SessionServer do
         })
 
       broadcast(state, {:info_released, release})
+
+      state =
+        if speak and state.call_state == :active and release.content not in [nil, ""] do
+          queue_voice(state, :speech, release.content, "caller", %{"info_key" => release.key})
+        else
+          state
+        end
+
       {:ok, release, state}
     end
   end
@@ -409,7 +567,7 @@ defmodule DispatchTrainer.Sessions.SessionServer do
   defp release_initial(state) do
     Enum.reduce(state.scenario.info_releases, state, fn release, acc ->
       if release.initially_available do
-        case do_release(acc, release.key, "caller") do
+        case do_release(acc, release.key, "caller", false) do
           {:ok, _release, acc} -> acc
           {:error, _reason, acc} -> acc
         end

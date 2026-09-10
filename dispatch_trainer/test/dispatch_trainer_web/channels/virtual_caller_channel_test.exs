@@ -70,4 +70,17 @@ defmodule DispatchTrainerWeb.VirtualCallerChannelTest do
                %{}
              )
   end
+
+  test "非本会话的教员不能加入他人的虚拟来电端", %{session: session} do
+    other = instructor_fixture()
+    socket = connect_user_socket(other)
+
+    assert {:error, %{reason: "forbidden"}} =
+             subscribe_and_join(
+               socket,
+               DispatchTrainerWeb.VirtualCallerChannel,
+               "virtual_caller:#{session.id}",
+               %{}
+             )
+  end
 end

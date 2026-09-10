@@ -15,7 +15,8 @@ defmodule DispatchTrainerWeb.VirtualCallerChannel do
     user = Accounts.get_user(socket.assigns.user_id)
     session = Sessions.get_session!(session_id)
 
-    if user && (user.id == session.instructor_id or Accounts.User.instructor?(user)) do
+    # 仅主持该会话的教员(或管理员)可驱动虚拟来电端
+    if user && (user.id == session.instructor_id or Accounts.User.admin?(user)) do
       {:ok, server} = SessionServer.ensure_started(session.id)
       :ok = SessionServer.join_call(server)
       Sessions.subscribe(session.id)

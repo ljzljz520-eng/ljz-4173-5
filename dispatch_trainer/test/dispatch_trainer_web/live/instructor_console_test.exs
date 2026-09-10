@@ -23,6 +23,22 @@ defmodule DispatchTrainerWeb.InstructorConsoleTest do
     assert {:error, {:redirect, %{to: "/"}}} = live(conn, ~p"/instructor/sessions/#{session.id}")
   end
 
+  test "非主持教员不能查看或操作他人会话, 被重定向回控制台首页", %{conn: conn, session: session} do
+    other_instructor = instructor_fixture()
+    conn = log_in_user(conn, other_instructor)
+
+    assert {:error, {:redirect, %{to: "/instructor"}}} =
+             live(conn, ~p"/instructor/sessions/#{session.id}")
+  end
+
+  test "管理员可查看任意会话控制台", %{conn: conn, session: session} do
+    admin = admin_fixture()
+    assert {:ok, _view, html} =
+             conn |> log_in_user(admin) |> live(~p"/instructor/sessions/#{session.id}")
+
+    assert html =~ "演练控制台"
+  end
+
   test "控制台显示隐藏条件、信息释放与分支按钮", %{
     conn: conn,
     session: session,

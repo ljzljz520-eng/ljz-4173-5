@@ -101,6 +101,13 @@ defmodule DispatchTrainerWeb.TraineeLive.Call do
     {:noreply, socket |> stream_insert(:events, event, at: 0) |> refresh()}
   end
 
+  def handle_info({:caller_speech, "speech", text}, socket) do
+    {:noreply,
+     socket
+     |> update(:caller_lines, fn lines -> Enum.take([text | lines], 20) end)
+     |> refresh()}
+  end
+
   def handle_info({:call_state, _}, socket), do: {:noreply, refresh(socket)}
   def handle_info({:info_released, _}, socket), do: {:noreply, refresh(socket)}
   def handle_info(_message, socket), do: {:noreply, socket}
@@ -223,9 +230,16 @@ defmodule DispatchTrainerWeb.TraineeLive.Call do
         phx-hook="OpusAudio"
         data-session-id={@session.id}
         data-token={@audio_token}
+        data-active={if @session.status in ["active", "interrupted"], do: "1", else: "0"}
         class="border rounded p-4 text-sm text-zinc-500"
       >
-        音频通道(Opus/WebSocket)由浏览器端钩子建立。
+        <span :if={@session.status in ["scheduled", "ringing"]}>
+          点击「接听来电」后接通音频通道(首次需在页面任意处点击以允许声音播放)。
+        </span>
+        <span :if={@session.status in ["active", "interrupted"]}>
+          音频通道(Opus/WebSocket)已接通, 来电者语音实时播放。
+        </span>
+        <span :if={@session.status == "ended"}>通话已结束。</span>
       </section>
 
       <.button :if={@session.status in ["scheduled", "ringing"]} phx-click="join" class="w-full">

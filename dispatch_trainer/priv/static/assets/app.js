@@ -58,6 +58,83 @@
     return { seq: view.getUint32(3), sentAtMs: view.getUint32(7), opus: data.slice(9) };
   }
 
+  // 服务端来电者/背景声 PCM 推送帧:
+  // magic(16)=0xD15D | kind(8) | flags(8) | frame_seq(32) | frame_ms(32) | s16le pcm(48k mono)
+  const PCM_MAGIC = 0xd15d;
+  const PCM_KIND_SPEECH = 1;
+  const PCM_KIND_AMBIENCE = 2;
+
+  function decodePcmFrame(data) {
+    const view = new DataView(data);
+    if (view.byteLength < 12 || view.getUint16(0) !== PCM_MAGIC) return null;
+    const kind = view.getUint8(2);
+    const frameMs = view.getUint32(7);
+    const pcmBytes = new Int16Array(data.slice(12));
+    return { kind, frameMs, pcm: pcmBytes };
+  }
+
+  // 简易 FIFO 播放队列: ScriptProcessor 按声卡节奏取 PCM,
+  // 队列暂时为空时补零(不阻塞), 天然吸收网络抖动。
+  class PcmPlayer {
+    constructor(sampleRate) {
+      this.sampleRate = sampleRate;
+      this.queue = []; // Int16Array 帧
+      this.cursor = 0;
+      this.ctx = null;
+      this.node = null;
+      this.volume = 1.0;
+    }
+    ensure() {
+      if (this.ctx) return;
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      this.ctx = new Ctx({ sampleRate: this.sampleRate });
+      const bufferSize = 4096;
+      this.node = this.ctx.createScriptProcessor(bufferSize, 0, 1);
+      this.gain = this.ctx.createGain();
+      this.gain.gain.value = this.volume;
+      this.node.onaudioprocess = (e) => this.pull(e);
+      this.node.connect(this.gain);
+      this.gain.connect(this.ctx.destination);
+    }
+    // 浏览器自动播放策略: 必须在用户手势里 resume
+    unlock() {
+      this.ensure();
+      if (this.ctx && this.ctx.state === "suspended") this.ctx.resume();
+    }
+    enqueue(pcm, kind) {
+      this.ensure();
+      if (!this.ctx) return; // 无输出环境: 静默丢弃
+      if (kind === PCM_KIND_AMBIENCE) {
+        const scaled = new Int16Array(pcm.length);
+        for (let i = 0; i < pcm.length; i++) scaled[i] = Math.round(pcm[i] * 0.6);
+        this.queue.push(scaled);
+      } else {
+        this.queue.push(pcm);
+      }
+    }
+    pull(e) {
+      const out = e.outputBuffer.getChannelData(0);
+      for (let i = 0; i < out.length; i++) {
+        let sample = 0;
+        while (this.queue.length) {
+          const frame = this.queue[0];
+          if (this.cursor < frame.length) { sample = frame[this.cursor++] / 32768; break; }
+          this.queue.shift();
+          this.cursor = 0;
+        }
+        out[i] = sample;
+      }
+      // 限制内存: 网络长期过快时丢弃最旧的待播帧
+      if (this.queue.length > 200) this.queue.splice(0, this.queue.length - 200);
+    }
+    close() {
+      try { this.node && this.node.disconnect(); } catch (_) {}
+      try { this.ctx && this.ctx.close(); } catch (_) {}
+      this.ctx = null;
+    }
+  }
+
   const Hooks = {};
 
   // 音频通话 Hook: 挂载在学员/教员通话页容器上
@@ -73,10 +150,19 @@
       this.jitter = new JitterBuffer(10);
       this.seq = 0;
       this.t0 = performance.now();
+      // 来电者 PCM 音频(48k) → 可听见
+      this.pcm = new PcmPlayer(48000);
 
       this.channel.onMessage((_event, payload) => {
         if (payload instanceof ArrayBuffer || payload instanceof Blob) {
           (payload instanceof Blob ? payload.arrayBuffer() : Promise.resolve(payload)).then((buf) => {
+            // 优先识别服务端来电 PCM 帧(magic 0xD15D)
+            const pcmFrame = decodePcmFrame(buf);
+            if (pcmFrame) {
+              this.pcm.enqueue(pcmFrame.pcm, pcmFrame.kind);
+              return;
+            }
+            // 对端 Opus 麦克风帧(magic 0xD15C)
             const pkt = decodePacket(buf);
             if (pkt) {
               this.jitter.push(pkt.seq, pkt.opus);
@@ -89,6 +175,28 @@
         return payload;
       });
 
+      // 用户首次点击页面时解锁音频(浏览器自动播放策略)
+      this._unlock = () => this.pcm.unlock();
+      window.addEventListener("pointerdown", this._unlock, { once: true });
+      window.addEventListener("keydown", this._unlock, { once: true });
+
+      // 仅在学员已“接听”(会话进入 active/interrupted)后才加入通话,
+      // 避免接通前就触发服务器的 join_call
+      this._joined = false;
+      if (this.el.dataset.active === "1") this.joinCall();
+      else {
+        this.el.addEventListener("click", () => this.joinCall(), { once: true });
+        // LiveView 重渲染后 data-active 变为 1
+        this._mo = new MutationObserver(() => {
+          if (this.el.dataset.active === "1") this.joinCall();
+        });
+        this._mo.observe(this.el, { attributes: true, attributeFilter: ["data-active"] });
+      }
+    },
+    joinCall() {
+      if (this._joined) return;
+      this._joined = true;
+      this._mo && this._mo.disconnect();
       this.channel.join()
         .receive("ok", () => this.startCapture())
         .receive("error", (resp) => console.warn("call join failed", resp));
@@ -124,11 +232,37 @@
         console.warn("audio capture unavailable", e);
       }
     },
-    playOpus(_opus) {
-      // 解码播放由 WebCodecs AudioDecoder 完成; 训练环境无输出设备时静默丢弃
+    playOpus(opus) {
+      // 对端真人麦克风 Opus 帧由 WebCodecs AudioDecoder 解码后送入同一 PCM 队列;
+      // 无 WebCodecs 环境下来电者语音(PCM 帧)仍可正常听见。
+      if (typeof AudioDecoder === "undefined") return;
+      if (!this.opusDecoder) {
+        this.opusDecoder = new AudioDecoder({
+          output: (audioData) => {
+            const n = Math.min(audioData.numberOfFrames, 48000);
+            const down = new Float32Array(n);
+            audioData.copyTo(down, { planeIndex: 0, frameCount: n });
+            const s16 = new Int16Array(n);
+            for (let i = 0; i < n; i++) s16[i] = Math.max(-1, Math.min(1, down[i])) * 32767;
+            this.pcm.enqueue(s16, PCM_KIND_SPEECH);
+            audioData.close();
+          },
+          error: (e) => console.warn("opus decoder error", e),
+        });
+        this.opusDecoder.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1 });
+      }
+      if (this.opusDecoder.state === "configured") {
+        this.opusDecoder.decode(new EncodedAudioChunk({
+          type: "key", timestamp: 0, data: opus,
+        }));
+      }
     },
     destroyed() {
+      window.removeEventListener("pointerdown", this._unlock);
+      window.removeEventListener("keydown", this._unlock);
+      this._mo && this._mo.disconnect();
       this.channel && this.channel.leave();
+      this.pcm && this.pcm.close();
     },
   };
 

@@ -8,36 +8,51 @@ defmodule DispatchTrainerWeb.InstructorLive.Console do
   """
   use DispatchTrainerWeb, :live_view
 
-  alias DispatchTrainer.{Evaluations, Sessions}
-  alias DispatchTrainer.Sessions.SessionServer
+  alias DispatchTrainer.{Accounts, Evaluations, Sessions}
+  alias DispatchTrainer.Sessions.{Session, SessionServer}
 
   @impl true
   def mount(%{"id" => session_id}, _session, socket) do
     session = Sessions.get_session!(session_id)
-    {:ok, server} = SessionServer.ensure_started(session.id)
+    user = socket.assigns.current_user
 
-    if connected?(socket), do: Sessions.subscribe(session.id)
+    if owns_session?(user, session) do
+      {:ok, server} = SessionServer.ensure_started(session.id)
 
-    events = Sessions.list_events(session.id)
-    evaluation = Evaluations.get_evaluation_for_session(session.id)
+      if connected?(socket), do: Sessions.subscribe(session.id)
 
-    socket =
-      socket
-      |> assign(:page_title, "演练控制台 ##{session.id}")
-      |> assign(:session, session)
-      |> assign(:scenario, session.scenario)
-      |> assign(:server, server)
-      |> assign(:server_state, server_state(server))
-      |> assign(:evaluation, evaluation)
-      |> assign(:score_form, to_form(%{}, as: :scores))
-      |> stream(:events, Enum.reverse(events))
+      events = Sessions.list_events(session.id)
+      evaluation = Evaluations.get_evaluation_for_session(session.id)
 
-    if connected?(socket) and session.status in ["active", "interrupted"] do
-      :timer.send_interval(1000, self(), :tick)
+      socket =
+        socket
+        |> assign(:page_title, "演练控制台 ##{session.id}")
+        |> assign(:session, session)
+        |> assign(:scenario, session.scenario)
+        |> assign(:server, server)
+        |> assign(:server_state, server_state(server))
+        |> assign(:evaluation, evaluation)
+        |> assign(:score_form, to_form(%{}, as: :scores))
+        |> stream(:events, Enum.reverse(events))
+
+      if connected?(socket) and session.status in ["active", "interrupted"] do
+        :timer.send_interval(1000, self(), :tick)
+      end
+
+      {:ok, socket}
+    else
+      socket =
+        socket
+        |> put_flash(:error, "无权操作该演练会话。")
+        |> redirect(to: ~p"/instructor")
+
+      {:ok, socket}
     end
-
-    {:ok, socket}
   end
+
+  # 仅主持教员本人或管理员可查看/操作会话
+  defp owns_session?(%Accounts.User{id: id}, %Session{instructor_id: id}), do: true
+  defp owns_session?(%Accounts.User{} = user, %Session{}), do: Accounts.User.admin?(user)
 
   # ---- 控制事件 ----
 
@@ -81,19 +96,10 @@ defmodule DispatchTrainerWeb.InstructorLive.Console do
   end
 
   def handle_event("background_audio", %{"key" => key}, socket) do
-    audio = Enum.find(socket.assigns.scenario.background_audios, &(&1.key == key))
-
-    if audio do
-      {:ok, _} =
-        Sessions.log_event(socket.assigns.session, "instructor", "background_audio", %{
-          "key" => audio.key,
-          "label" => audio.label
-        }, elapsed(socket.assigns.session))
-
-      Sessions.broadcast(socket.assigns.session.id, {:background_audio, audio})
+    case SessionServer.play_background(socket.assigns.server, key) do
+      {:ok, _audio} -> {:noreply, refresh(socket)}
+      {:error, _reason} -> {:noreply, put_flash(socket, :error, "背景声播放失败")}
     end
-
-    {:noreply, socket}
   end
 
   def handle_event("mark_pii", %{"label" => label}, socket) do

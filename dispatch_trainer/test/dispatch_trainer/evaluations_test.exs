@@ -105,4 +105,16 @@ defmodule DispatchTrainer.EvaluationsTest do
     events = DispatchTrainer.Sessions.list_events(session.id)
     assert Enum.any?(events, &(&1.kind == "score" and &1.payload["total_score"] == 60))
   end
+
+  test "非主持教员不能给他人会话评分", %{session: session} do
+    other = instructor_fixture()
+
+    scores = %{
+      "confirm_address" => %{"score" => 20},
+      "identify_danger" => %{"score" => 20},
+      "instruct" => %{"score" => 20}
+    }
+
+    assert {:error, :forbidden} = Evaluations.score_session(other, session, scores)
+  end
 end

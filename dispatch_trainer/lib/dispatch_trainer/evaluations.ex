@@ -39,7 +39,8 @@ defmodule DispatchTrainer.Evaluations do
     session = Repo.preload(session, :scenario)
     rubric = session.scenario.rubric_items
 
-    with :ok <- validate_scores(rubric, scores) do
+    with :ok <- authorize_instructor(instructor, session),
+         :ok <- validate_scores(rubric, scores) do
       items =
         Enum.map(rubric, fn item ->
           entry = scores[item.key] || %{}
@@ -102,6 +103,11 @@ defmodule DispatchTrainer.Evaluations do
       end
     end
   end
+
+  # 仅主持教员本人或管理员可为会话评分
+  defp authorize_instructor(%User{id: id}, %Session{instructor_id: id}), do: :ok
+  defp authorize_instructor(%User{role: "admin"}, %Session{}), do: :ok
+  defp authorize_instructor(%User{}, %Session{}), do: {:error, :forbidden}
 
   defp validate_scores(rubric, scores) do
     errors =
